@@ -111,7 +111,8 @@ func makeFactory(
   exportInterval: Duration = .seconds(60),
   shutdownTimeout: Duration = .seconds(8),
   timerBuckets: DistributionBuckets = .defaultTimer,
-  recorderBuckets: DistributionBuckets = .defaultRecorder
+  recorderBuckets: DistributionBuckets = .defaultRecorder,
+  idleExpiration: IdleExpiration? = .default
 ) -> GoogleCloudMetricsFactory {
   GoogleCloudMetricsFactory(
     projectID: "test-project",
@@ -121,6 +122,7 @@ func makeFactory(
     shutdownTimeout: shutdownTimeout,
     timerBuckets: timerBuckets,
     recorderBuckets: recorderBuckets,
+    idleExpiration: idleExpiration,
     writer: writer,
     minimumExportInterval: .zero,
     now: { clock.now }

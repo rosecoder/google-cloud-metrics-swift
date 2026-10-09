@@ -70,9 +70,38 @@ Distribution buckets can be configured with `timerBuckets` and `recorderBuckets`
 
 Names are sanitized to what Cloud Monitoring accepts: characters other than letters, digits, `_`, `.` and `/` in labels, and other than letters, digits and `_` in dimension keys, are replaced with `_`. Metrics which end up with the same name and dimensions share the same time series, so `http-requests` and `http_requests` are aggregated together. If metrics of different kinds (for example a `Counter` and a `Gauge`) share a name, only the first one created is exported and a warning is logged. At most 30 dimensions are exported per metric.
 
-Destroyed metrics are exported one last time before they are removed.
-
 Every unique combination of dimension values is a separate time series in Cloud Monitoring, and is billed as such. Avoid dimensions with unbounded values, like user IDs.
+
+### Idle expiration
+
+A metric is referenced while any `Counter`, `Timer`, etc. created for it is alive. Counters and distributions which are no longer referenced are exported one last time at the first export after their last update, and then removed. A metric created inline is therefore only written in intervals where it's updated:
+
+```swift
+Counter(label: "orders", dimensions: [("status", "paid")]).increment()
+```
+
+Creating the metric again starts a new cumulative interval after the last written point, which Cloud Monitoring counts as a reset of the same time series. `increase` and `rate` in PromQL count the first point of each interval in full, so no events are lost. Queries see no data for intervals without updates, so use `or vector(0)` where an absent series should read as zero.
+
+Hold on to a metric to keep its time series written on every export, for example a `Meter` counting up and down:
+
+```swift
+let activeSessions = Meter(label: "sessions_active")
+```
+
+Expiration is configured with `idleExpiration`:
+
+```swift
+// Keep unreferenced metrics for 5 minutes without updates, and also expire gauges.
+let metrics = try GoogleCloudMetricsFactory(
+  idleExpiration: IdleExpiration(after: .seconds(300), kinds: [.counters, .distributions, .gauges])
+)
+```
+
+- `after` is the time without updates before an unreferenced metric is removed, evaluated at each export. An isolated update costs about `after / exportInterval + 1` points. Defaults to `.zero`.
+- `kinds` defaults to `[.counters, .distributions]`. Gauges (`Meter` and non-aggregating `Recorder`) are only expired when `.gauges` is included, since an inline `Meter` used to count up and down would lose its value.
+- Pass `idleExpiration: nil` to never expire metrics, so every time series is written until the process exits.
+
+Destroyed metrics (`destroy()`) are always exported one last time and then removed once every `Counter`, `Timer`, etc. for them is destroyed.
 
 ## Querying
 

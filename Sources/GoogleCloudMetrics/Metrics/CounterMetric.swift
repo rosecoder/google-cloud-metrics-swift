@@ -8,6 +8,7 @@ final class CounterMetric: CounterHandler, ExportableMetric {
     var value: Int64 = 0
     var startTime: Date
     var lastEndTime: Date?
+    var updateCount: UInt64 = 0
   }
 
   let key: MetricKey
@@ -21,6 +22,10 @@ final class CounterMetric: CounterHandler, ExportableMetric {
     self.state = Mutex(State(startTime: startTime))
   }
 
+  var updateCount: UInt64 {
+    state.withLock { $0.updateCount }
+  }
+
   func increment(by amount: Int64) {
     guard amount > 0 else {
       return
@@ -28,12 +33,14 @@ final class CounterMetric: CounterHandler, ExportableMetric {
     state.withLock { state in
       let (sum, overflow) = state.value.addingReportingOverflow(amount)
       state.value = overflow ? .max : sum
+      state.updateCount &+= 1
     }
   }
 
   func reset() {
     state.withLock { state in
       state.value = 0
+      state.updateCount &+= 1
       state.startTime = cumulativeStartTime(now: now(), lastEndTime: state.lastEndTime)
     }
   }

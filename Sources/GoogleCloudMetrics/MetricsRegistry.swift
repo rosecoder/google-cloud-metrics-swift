@@ -146,6 +146,10 @@ protocol ExportableMetric: AnyObject, Sendable {
 
   var key: MetricKey { get }
 
+  /// Incremented on every accepted update, so idle metrics are detected without reading the
+  /// clock on every update.
+  var updateCount: UInt64 { get }
+
   /// Returns the point to export, or `nil` if there is nothing to export.
   func point(endingAt endTime: Date) -> MetricPoint?
 }
@@ -157,49 +161,73 @@ final class MetricsRegistry: Sendable {
 
   private struct Entry {
     let metric: any ExportableMetric
-    /// Number of handlers returned and not yet destroyed. Entries without references are
-    /// removed after their final value has been collected.
-    var references: Int
+    /// Number of handles which are neither destroyed nor deallocated.
+    var liveHandles = 1
+    /// Number of handles which are not destroyed. Entries where every handle is destroyed are
+    /// removed after their final value has been collected, regardless of idle expiration.
+    var undestroyedHandles = 1
+    var observedUpdateCount: UInt64 = 0
+    /// End time of the first collect which observed the latest update.
+    var lastActivity: Date?
   }
 
   private struct State {
     var entries: [MetricKey.Identity: Entry] = [:]
     var reportedConflicts: Set<MetricKey.Identity> = []
+    /// End time of the last point written for removed metrics, so a re-created metric starts
+    /// after it.
+    var lastEndTimes: [MetricKey.Identity: Date] = [:]
   }
 
   private let logger: Logger
+  private let idleExpiration: IdleExpiration?
+  private let idleExpirationInterval: TimeInterval
+  private let lastEndTimeRetention: TimeInterval
   private let state = Mutex(State())
 
-  init(logger: Logger) {
+  init(logger: Logger, idleExpiration: IdleExpiration?, exportInterval: Duration) {
     self.logger = logger
+    self.idleExpiration = idleExpiration
+    let idleExpirationAfter = idleExpiration?.after ?? .zero
+    self.idleExpirationInterval = idleExpirationAfter.timeInterval
+    self.lastEndTimeRetention = (max(idleExpirationAfter, exportInterval) + .seconds(3600))
+      .timeInterval
   }
 
-  /// Returns the existing metric for the key, or stores and returns a newly created one.
+  var lastEndTimeCount: Int {
+    state.withLock { $0.lastEndTimes.count }
+  }
+
+  /// Returns the existing metric for the key, or stores and returns a newly created one, and
+  /// leases it until `release(_:destroy:)` is called.
   ///
-  /// The same handler is returned for the same label and dimensions, so values are aggregated
-  /// across all `Counter`, `Timer`, etc. instances using the same identity.
+  /// The same metric is returned for the same label and dimensions, so values are aggregated
+  /// across all `Counter`, `Timer`, etc. instances using the same identity. `create` is passed
+  /// the end time of the last point written for a removed metric with the same identity.
   ///
   /// If a metric of another kind is already registered for the same identity, a new metric
-  /// which is never exported is returned, since Cloud Monitoring doesn't allow mixing kinds
-  /// within a metric type.
-  func metric<Metric: ExportableMetric>(
-    for key: MetricKey,
-    create: (MetricKey) -> Metric
-  ) -> Metric {
-    let result: (metric: Metric, isNew: Bool, conflictingKind: MetricKey.Kind?) = state.withLock {
-      state in
-      guard let existing = state.entries[key.identity] else {
-        let metric = create(key)
-        state.entries[key.identity] = Entry(metric: metric, references: 1)
-        return (metric, true, nil)
-      }
-      if existing.metric.key.kind == key.kind, let metric = existing.metric as? Metric {
-        state.entries[key.identity]!.references += 1
-        return (metric, false, nil)
-      }
-      let isFirstConflict = state.reportedConflicts.insert(key.identity).inserted
-      return (create(key), false, isFirstConflict ? existing.metric.key.kind : nil)
-    }
+  /// which is never exported and isn't leased is returned, since Cloud Monitoring doesn't allow
+  /// mixing kinds within a metric type.
+  func acquire<Metric: ExportableMetric>(
+    _ key: MetricKey,
+    create: (MetricKey, _ lastEndTime: Date?) -> Metric
+  ) -> (metric: Metric, isLeased: Bool) {
+    let result:
+      (metric: Metric, isNew: Bool, isLeased: Bool, conflictingKind: MetricKey.Kind?) =
+        state.withLock { state in
+          guard let existing = state.entries[key.identity] else {
+            let metric = create(key, state.lastEndTimes[key.identity])
+            state.entries[key.identity] = Entry(metric: metric)
+            return (metric, true, true, nil)
+          }
+          if existing.metric.key.kind == key.kind, let metric = existing.metric as? Metric {
+            state.entries[key.identity]!.liveHandles += 1
+            state.entries[key.identity]!.undestroyedHandles += 1
+            return (metric, false, true, nil)
+          }
+          let isFirstConflict = state.reportedConflicts.insert(key.identity).inserted
+          return (create(key, nil), false, false, isFirstConflict ? existing.metric.key.kind : nil)
+        }
     if result.isNew, key.droppedLabelCount > 0 {
       logger.warning(
         "Metric has more than \(MetricKey.maximumLabelCount) dimensions. Extra dimensions are dropped.",
@@ -214,44 +242,97 @@ final class MetricsRegistry: Sendable {
           "registered_kind": "\(conflictingKind)",
         ])
     }
-    return result.metric
+    return (result.metric, result.isLeased)
   }
 
-  /// Releases a handler. The metric is removed after its final value has been collected, unless
-  /// it's requested again before that.
-  func release(_ metric: (any ExportableMetric)?) {
-    guard let metric else {
-      return
-    }
+  /// Releases a lease. A metric without live handles is removed after its final value has been
+  /// collected, once every handle is destroyed or the metric has expired.
+  func release(_ metric: any ExportableMetric, destroy: Bool) {
     state.withLock { state in
-      guard let entry = state.entries[metric.key.identity], entry.metric === metric else {
+      guard var entry = state.entries[metric.key.identity], entry.metric === metric else {
         return
       }
-      state.entries[metric.key.identity]!.references = max(0, entry.references - 1)
+      entry.liveHandles = max(0, entry.liveHandles - 1)
+      if destroy {
+        entry.undestroyedHandles = max(0, entry.undestroyedHandles - 1)
+      }
+      state.entries[metric.key.identity] = entry
     }
   }
 
+  /// Returns the points to export and removes metrics which are exported for the last time.
+  ///
+  /// Update counts are read before the points, so an update racing with the collect either is
+  /// included in the exported point or keeps the metric for the next collect.
   func collect(endingAt endTime: Date) -> [MetricSnapshot] {
-    let (metrics, released) = state.withLock { state in
-      (
-        state.entries.values.map(\.metric),
-        state.entries.values.filter { $0.references == 0 }.map(\.metric)
-      )
+    let metrics = state.withLock { state in
+      if !state.lastEndTimes.isEmpty {
+        let cutoff = endTime.addingTimeInterval(-lastEndTimeRetention)
+        state.lastEndTimes = state.lastEndTimes.filter { $0.value > cutoff }
+      }
+      return state.entries.values.map(\.metric)
     }
-    let snapshots = metrics.compactMap { metric in
-      metric.point(endingAt: endTime).map { MetricSnapshot(key: metric.key, point: $0) }
+    let collected = metrics.map { metric in
+      let updateCount = metric.updateCount
+      return (metric: metric, updateCount: updateCount, point: metric.point(endingAt: endTime))
     }
-    if !released.isEmpty {
-      state.withLock { state in
-        for metric in released {
-          if let entry = state.entries[metric.key.identity], entry.metric === metric,
-            entry.references == 0
-          {
-            state.entries[metric.key.identity] = nil
-          }
-        }
+    state.withLock { state in
+      for (metric, updateCount, point) in collected {
+        removeIfFinal(
+          metric, updateCount: updateCount, isExported: point != nil, endTime: endTime,
+          state: &state)
       }
     }
-    return snapshots
+    return collected.compactMap { collected in
+      collected.point.map { MetricSnapshot(key: collected.metric.key, point: $0) }
+    }
+  }
+
+  private func removeIfFinal(
+    _ metric: any ExportableMetric,
+    updateCount: UInt64,
+    isExported: Bool,
+    endTime: Date,
+    state: inout State
+  ) {
+    let identity = metric.key.identity
+    guard var entry = state.entries[identity], entry.metric === metric else {
+      return
+    }
+    if entry.lastActivity == nil || updateCount != entry.observedUpdateCount {
+      entry.observedUpdateCount = updateCount
+      entry.lastActivity = endTime
+    }
+    let hasUnexportedUpdates = !isExported && updateCount > 0
+    let isRemovable =
+      entry.liveHandles == 0
+      && !hasUnexportedUpdates
+      && metric.updateCount == updateCount
+      && (entry.undestroyedHandles == 0 || isExpired(entry, endTime: endTime))
+    guard isRemovable else {
+      state.entries[identity] = entry
+      return
+    }
+    state.entries[identity] = nil
+    if isExported {
+      state.lastEndTimes[identity] = endTime
+    }
+  }
+
+  private func isExpired(_ entry: Entry, endTime: Date) -> Bool {
+    guard let idleExpiration, idleExpiration.contains(entry.metric.key.kind),
+      let lastActivity = entry.lastActivity
+    else {
+      return false
+    }
+    return endTime.timeIntervalSince(lastActivity) >= idleExpirationInterval
+  }
+}
+
+extension Duration {
+
+  fileprivate var timeInterval: TimeInterval {
+    let (seconds, attoseconds) = components
+    return TimeInterval(seconds) + TimeInterval(attoseconds) / 1e18
   }
 }

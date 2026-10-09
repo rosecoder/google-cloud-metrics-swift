@@ -16,25 +16,35 @@ final class DistributionMetric: RecorderHandler, TimerHandler, ExportableMetric 
   /// Larger values are dropped, since squaring their deviation from the mean could overflow.
   static let maximumMagnitude = 1e150
 
+  private struct State {
+    var snapshot: DistributionSnapshot
+    let startTime: Date
+    var updateCount: UInt64 = 0
+  }
+
   let key: MetricKey
 
   private let bounds: [Double]
-  private let state: Mutex<(snapshot: DistributionSnapshot, startTime: Date)>
+  private let state: Mutex<State>
 
   init(key: MetricKey, buckets: DistributionBuckets, startTime: Date) {
     self.key = key
     self.bounds = buckets.bounds
     self.state = Mutex(
-      (
-        DistributionSnapshot(
+      State(
+        snapshot: DistributionSnapshot(
           count: 0,
           mean: 0,
           sumOfSquaredDeviation: 0,
           bucketCounts: Array(repeating: 0, count: buckets.bounds.count + 1),
           buckets: buckets
         ),
-        startTime
+        startTime: startTime
       ))
+  }
+
+  var updateCount: UInt64 {
+    state.withLock { $0.updateCount }
   }
 
   func record(_ value: Int64) {
@@ -56,6 +66,7 @@ final class DistributionMetric: RecorderHandler, TimerHandler, ExportableMetric 
         .greatestFiniteMagnitude
       )
       state.snapshot.bucketCounts[bucketIndex] += 1
+      state.updateCount &+= 1
     }
   }
 
@@ -67,7 +78,7 @@ final class DistributionMetric: RecorderHandler, TimerHandler, ExportableMetric 
   }
 
   func point(endingAt endTime: Date) -> MetricPoint? {
-    let (snapshot, startTime) = state.withLock { $0 }
+    let (snapshot, startTime) = state.withLock { ($0.snapshot, $0.startTime) }
     guard snapshot.count > 0,
       endTime.timeIntervalSince(startTime) >= minimumCumulativeInterval
     else {

@@ -75,6 +75,29 @@ struct IntegrationTests {
     }
   }
 
+  @Test func expiredCounterIsRecreatedAfterPreviousPoint() async throws {
+    let factory = try GoogleCloudMetricsFactory(idleExpiration: IdleExpiration(after: .zero))
+    let label = "swift_integration_test/expiring_counter"
+    let dimensions = [("run_id", runID)]
+
+    try await withRunningConnection(factory.writer) {
+      Counter(label: label, dimensions: dimensions, factory: factory).increment(by: 2)
+      try await Task.sleep(for: .milliseconds(100))
+      try await factory.export()
+
+      Counter(label: label, dimensions: dimensions, factory: factory).increment(by: 3)
+      try await Task.sleep(for: GoogleCloudMetricsFactory.minimumExportInterval + .seconds(1))
+      try await factory.export()
+    }
+
+    try await withMetricReader { reader in
+      let counter = try await reader.waitForTimeSeries(
+        type: label, runID: runID, minimumPointCount: 2)
+      #expect(counter.points.map(\.value.int64Value) == [3, 2])
+      #expect(counter.points[0].interval.startTime.date > counter.points[1].interval.endTime.date)
+    }
+  }
+
   @Test func exportOnGracefulShutdown() async throws {
     var logger = Logger(label: "test")
     logger.logLevel = .trace
@@ -166,11 +189,14 @@ private struct MetricReader {
   func waitForTimeSeries(
     type: String,
     runID: String,
+    minimumPointCount: Int = 1,
     timeout: Duration = .seconds(180)
   ) async throws -> Google_Monitoring_V3_TimeSeries {
     let deadline = ContinuousClock.now.advanced(by: timeout)
     while ContinuousClock.now < deadline {
-      if let timeSeries = try await listTimeSeries(type: type, runID: runID).first {
+      if let timeSeries = try await listTimeSeries(type: type, runID: runID)
+        .first(where: { $0.points.count >= minimumPointCount })
+      {
         return timeSeries
       }
       try await Task.sleep(for: .seconds(5))

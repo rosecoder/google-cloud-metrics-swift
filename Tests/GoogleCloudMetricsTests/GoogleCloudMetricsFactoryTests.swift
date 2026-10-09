@@ -223,8 +223,11 @@ import Testing
     #expect(writer.requests.isEmpty)
   }
 
-  @Test func destroyedMetricIsExportedOnceMoreAndThenRemoved() async throws {
-    let factory = makeFactory(writer: writer, clock: clock)
+  @Test(arguments: [IdleExpiration?.none, .default])
+  func destroyedMetricIsExportedOnceMoreAndThenRemoved(idleExpiration: IdleExpiration?)
+    async throws
+  {
+    let factory = makeFactory(writer: writer, clock: clock, idleExpiration: idleExpiration)
 
     let counter = Counter(label: "requests", factory: factory)
     counter.increment()
@@ -242,8 +245,11 @@ import Testing
       writer.requests[1].timeSeries.map(\.metric.type) == ["custom.googleapis.com/temperature"])
   }
 
-  @Test func destroyedMetricIsKeptWhileOtherHandlersExist() async throws {
-    let factory = makeFactory(writer: writer, clock: clock)
+  @Test(arguments: [IdleExpiration?.none, .default])
+  func destroyedMetricIsKeptWhileOtherHandlersExist(idleExpiration: IdleExpiration?)
+    async throws
+  {
+    let factory = makeFactory(writer: writer, clock: clock, idleExpiration: idleExpiration)
 
     let first = Counter(label: "requests", factory: factory)
     let second = Counter(label: "requests", factory: factory)
@@ -255,12 +261,16 @@ import Testing
     second.increment()
     clock.advance(by: 60)
     try await factory.export()
+    clock.advance(by: 60)
+    try await factory.export()
+    withExtendedLifetime(second) {}
 
-    #expect(writer.writtenTimeSeries.map { $0.points[0].value.int64Value } == [1, 2])
+    #expect(writer.writtenTimeSeries.map { $0.points[0].value.int64Value } == [1, 2, 2])
   }
 
-  @Test func metricRecreatedBeforeExportIsKept() async throws {
-    let factory = makeFactory(writer: writer, clock: clock)
+  @Test(arguments: [IdleExpiration?.none, .default])
+  func metricRecreatedBeforeExportIsKept(idleExpiration: IdleExpiration?) async throws {
+    let factory = makeFactory(writer: writer, clock: clock, idleExpiration: idleExpiration)
 
     Counter(label: "requests", factory: factory).destroy()
     let counter = Counter(label: "requests", factory: factory)
@@ -269,6 +279,24 @@ import Testing
     try await factory.export()
     clock.advance(by: 60)
     try await factory.export()
+    withExtendedLifetime(counter) {}
+
+    #expect(writer.writtenTimeSeries.count == 2)
+  }
+
+  @Test func destroyingTwiceReleasesOnce() async throws {
+    let factory = makeFactory(writer: writer, clock: clock, idleExpiration: nil)
+
+    let first = Counter(label: "requests", factory: factory)
+    let second = Counter(label: "requests", factory: factory)
+    first.increment()
+    first.destroy()
+    first.destroy()
+    clock.advance(by: 60)
+    try await factory.export()
+    clock.advance(by: 60)
+    try await factory.export()
+    withExtendedLifetime(second) {}
 
     #expect(writer.writtenTimeSeries.count == 2)
   }

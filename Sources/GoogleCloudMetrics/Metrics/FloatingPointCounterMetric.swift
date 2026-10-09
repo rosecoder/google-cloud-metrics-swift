@@ -8,6 +8,7 @@ final class FloatingPointCounterMetric: FloatingPointCounterHandler, ExportableM
     var value: Double = 0
     var startTime: Date
     var lastEndTime: Date?
+    var updateCount: UInt64 = 0
   }
 
   let key: MetricKey
@@ -21,18 +22,24 @@ final class FloatingPointCounterMetric: FloatingPointCounterHandler, ExportableM
     self.state = Mutex(State(startTime: startTime))
   }
 
+  var updateCount: UInt64 {
+    state.withLock { $0.updateCount }
+  }
+
   func increment(by amount: Double) {
     guard amount > 0, amount.isFinite else {
       return
     }
     state.withLock { state in
       state.value = min(state.value + amount, .greatestFiniteMagnitude)
+      state.updateCount &+= 1
     }
   }
 
   func reset() {
     state.withLock { state in
       state.value = 0
+      state.updateCount &+= 1
       state.startTime = cumulativeStartTime(now: now(), lastEndTime: state.lastEndTime)
     }
   }

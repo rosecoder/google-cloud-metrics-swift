@@ -25,6 +25,7 @@ public final class GoogleCloudMetricsFactory: MetricsFactory, Service {
   public let metricTypePrefix: String
   public let timerBuckets: DistributionBuckets
   public let recorderBuckets: DistributionBuckets
+  public let idleExpiration: IdleExpiration?
 
   let projectID: String?
   let resource: MonitoredResource?
@@ -51,6 +52,9 @@ public final class GoogleCloudMetricsFactory: MetricsFactory, Service {
   ///     seconds, which fits within the 10 seconds Cloud Run waits after sending `SIGTERM`.
   ///   - timerBuckets: Buckets used for timers. Timers are exported in milliseconds.
   ///   - recorderBuckets: Buckets used for aggregating recorders.
+  ///   - idleExpiration: When metrics which are no longer referenced by any `Counter`, `Timer`,
+  ///     etc. stop being exported. Defaults to removing counters and distributions after the
+  ///     export following their last update. Pass `nil` to only remove destroyed metrics.
   ///   - authorizationProvider: Provider used to authorize requests to Cloud Monitoring.
   public convenience init(
     projectID: String? = nil,
@@ -60,6 +64,7 @@ public final class GoogleCloudMetricsFactory: MetricsFactory, Service {
     shutdownTimeout: Duration = .seconds(8),
     timerBuckets: DistributionBuckets = .defaultTimer,
     recorderBuckets: DistributionBuckets = .defaultRecorder,
+    idleExpiration: IdleExpiration? = .default,
     authorizationProvider: GoogleCloudAuth.Provider = DefaultProvider.shared
   ) throws {
     precondition(
@@ -74,6 +79,7 @@ public final class GoogleCloudMetricsFactory: MetricsFactory, Service {
       shutdownTimeout: shutdownTimeout,
       timerBuckets: timerBuckets,
       recorderBuckets: recorderBuckets,
+      idleExpiration: idleExpiration,
       writer: try MetricServiceConnection(
         scopes: ["https://www.googleapis.com/auth/monitoring.write"],
         authorizationProvider: authorizationProvider
@@ -91,10 +97,14 @@ public final class GoogleCloudMetricsFactory: MetricsFactory, Service {
     shutdownTimeout: Duration,
     timerBuckets: DistributionBuckets,
     recorderBuckets: DistributionBuckets,
+    idleExpiration: IdleExpiration?,
     writer: any TimeSeriesWriter,
     minimumExportInterval: Duration,
     now: @escaping @Sendable () -> Date
   ) {
+    precondition(
+      (idleExpiration?.after ?? .zero) >= .zero, "Idle expiration must not be negative.")
+
     self.projectID = projectID
     self.resource = resource
     self.metricTypePrefix = metricTypePrefix
@@ -102,8 +112,10 @@ public final class GoogleCloudMetricsFactory: MetricsFactory, Service {
     self.shutdownTimeout = shutdownTimeout
     self.timerBuckets = timerBuckets
     self.recorderBuckets = recorderBuckets
+    self.idleExpiration = idleExpiration
     self.writer = writer
-    self.registry = MetricsRegistry(logger: logger)
+    self.registry = MetricsRegistry(
+      logger: logger, idleExpiration: idleExpiration, exportInterval: exportInterval)
     self.minimumExportInterval = minimumExportInterval
     self.now = now
   }
@@ -312,42 +324,52 @@ public final class GoogleCloudMetricsFactory: MetricsFactory, Service {
   // MARK: - MetricsFactory
 
   public func makeCounter(label: String, dimensions: [(String, String)]) -> CounterHandler {
-    registry.metric(for: key(.counter, label: label, dimensions: dimensions)) {
-      CounterMetric(key: $0, startTime: now(), now: now)
+    let (metric, isLeased) = registry.acquire(key(.counter, label: label, dimensions: dimensions)) {
+      CounterMetric(key: $0, startTime: startTime(after: $1), now: now)
     }
+    return CounterHandle(metric: metric, registry: isLeased ? registry : nil)
   }
 
   public func makeFloatingPointCounter(label: String, dimensions: [(String, String)])
     -> FloatingPointCounterHandler
   {
-    registry.metric(for: key(.floatingPointCounter, label: label, dimensions: dimensions)) {
-      FloatingPointCounterMetric(key: $0, startTime: now(), now: now)
+    let (metric, isLeased) = registry.acquire(
+      key(.floatingPointCounter, label: label, dimensions: dimensions)
+    ) {
+      FloatingPointCounterMetric(key: $0, startTime: startTime(after: $1), now: now)
     }
+    return FloatingPointCounterHandle(metric: metric, registry: isLeased ? registry : nil)
   }
 
   public func makeMeter(label: String, dimensions: [(String, String)]) -> MeterHandler {
-    registry.metric(for: key(.gauge, label: label, dimensions: dimensions)) {
-      GaugeMetric(key: $0)
+    let (metric, isLeased) = registry.acquire(key(.gauge, label: label, dimensions: dimensions)) {
+      key, _ in GaugeMetric(key: key)
     }
+    return MeterHandle(metric: metric, registry: isLeased ? registry : nil)
   }
 
   public func makeRecorder(label: String, dimensions: [(String, String)], aggregate: Bool)
     -> RecorderHandler
   {
     if aggregate {
-      return registry.metric(for: key(.recorder, label: label, dimensions: dimensions)) {
-        DistributionMetric(key: $0, buckets: recorderBuckets, startTime: now())
+      let (metric, isLeased) = registry.acquire(
+        key(.recorder, label: label, dimensions: dimensions)
+      ) {
+        DistributionMetric(key: $0, buckets: recorderBuckets, startTime: startTime(after: $1))
       }
+      return RecorderHandle(metric: metric, registry: isLeased ? registry : nil)
     }
-    return registry.metric(for: key(.gauge, label: label, dimensions: dimensions)) {
-      GaugeMetric(key: $0)
+    let (metric, isLeased) = registry.acquire(key(.gauge, label: label, dimensions: dimensions)) {
+      key, _ in GaugeMetric(key: key)
     }
+    return RecorderHandle(metric: metric, registry: isLeased ? registry : nil)
   }
 
   public func makeTimer(label: String, dimensions: [(String, String)]) -> TimerHandler {
-    registry.metric(for: key(.timer, label: label, dimensions: dimensions)) {
-      DistributionMetric(key: $0, buckets: timerBuckets, startTime: now())
+    let (metric, isLeased) = registry.acquire(key(.timer, label: label, dimensions: dimensions)) {
+      DistributionMetric(key: $0, buckets: timerBuckets, startTime: startTime(after: $1))
     }
+    return TimerHandle(metric: metric, registry: isLeased ? registry : nil)
   }
 
   private func key(_ kind: MetricKey.Kind, label: String, dimensions: [(String, String)])
@@ -356,23 +378,29 @@ public final class GoogleCloudMetricsFactory: MetricsFactory, Service {
     MetricKey(kind: kind, label: label, dimensions: dimensions, metricTypePrefix: metricTypePrefix)
   }
 
+  /// Cloud Monitoring treats a re-created metric as the same time series, so its first interval
+  /// must start after the last point written before it was removed.
+  private func startTime(after lastEndTime: Date?) -> Date {
+    cumulativeStartTime(now: now(), lastEndTime: lastEndTime)
+  }
+
   public func destroyCounter(_ handler: CounterHandler) {
-    registry.release(handler as? any ExportableMetric)
+    (handler as? any LeasedHandle)?.destroy()
   }
 
   public func destroyFloatingPointCounter(_ handler: FloatingPointCounterHandler) {
-    registry.release(handler as? any ExportableMetric)
+    (handler as? any LeasedHandle)?.destroy()
   }
 
   public func destroyMeter(_ handler: MeterHandler) {
-    registry.release(handler as? any ExportableMetric)
+    (handler as? any LeasedHandle)?.destroy()
   }
 
   public func destroyRecorder(_ handler: RecorderHandler) {
-    registry.release(handler as? any ExportableMetric)
+    (handler as? any LeasedHandle)?.destroy()
   }
 
   public func destroyTimer(_ handler: TimerHandler) {
-    registry.release(handler as? any ExportableMetric)
+    (handler as? any LeasedHandle)?.destroy()
   }
 }
