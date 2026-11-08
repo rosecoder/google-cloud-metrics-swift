@@ -113,10 +113,9 @@ rate(custom_googleapis_com:http_requests{monitored_resource="generic_task"}[5m])
 
 ## Development
 
-gRPC code is generated from [googleapis](https://github.com/googleapis/googleapis), included as a submodule:
+gRPC code is generated from [googleapis](https://github.com/googleapis/googleapis), fetched at a pinned commit into the git-ignored `googleapis/` directory by the generator script (override with `GOOGLEAPIS_COMMIT`):
 
 ```sh
-git submodule update --init
 bash Scripts/generate-grpc.bash
 ```
 
